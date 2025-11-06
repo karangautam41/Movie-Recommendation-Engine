@@ -1,22 +1,45 @@
 # app.py
-# Streamlit movie recommender with robust handling for missing dataset + uploader fallback
-# Author: ChatGPT (edited for you)
+# Streamlit movie recommender with automatic fallback dataset, uploader, and robust preprocessing.
 # Usage: streamlit run app.py
 
 import streamlit as st
 import pandas as pd
 import pickle
 import re
+import io
 import pathlib
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# ---------- CONFIGURATION ----------
-# Robustly determine base dir (some runtimes don't set __file__)
+# --------------------------
+# 0) BUILT-IN SAMPLE DATASET
+# --------------------------
+# Minimal, valid sample matching the Kaggle schema so the app "just works".
+SAMPLE_NETFLIX_CSV = """show_id,type,title,director,cast,country,date_added,release_year,rating,duration,listed_in,description
+s1,Movie,Inception,Christopher Nolan,Leonardo DiCaprio|Joseph Gordon-Levitt|Ellen Page,United States,September 1, 2010,2010,PG-13,148 min,Action & Adventure, A thief who enters dreams must plant an idea to redeem himself.
+s2,Movie,The Matrix,Lana Wachowski|Lilly Wachowski,Keanu Reeves|Laurence Fishburne|Carrie-Anne Moss,United States,April 1, 1999,1999,R,136 min,Sci-Fi & Fantasy, A hacker learns reality is a simulation and fights its controllers.
+s3,Movie,Interstellar,Christopher Nolan,Matthew McConaughey|Anne Hathaway|Jessica Chastain,United States,November 7, 2014,2014,PG-13,169 min,Sci-Fi & Fantasy, Explorers travel through a wormhole in space in an attempt to ensure humanity's survival.
+s4,Movie,The Irishman,Martin Scorsese,Robert De Niro|Al Pacino|Joe Pesci,United States,November 27, 2019,2019,R,209 min,Dramas, A hitman reflects on his life and ties to organized crime.
+s5,Movie,Roma,Alfonso Cuarón,Yalitza Aparicio|Marina de Tavira,Mexico,December 14, 2018,2018,R,135 min,Dramas, A year in the life of a middle-class family's maid in 1970s Mexico City.
+s6,Movie,Bird Box,Susanne Bier,Sandra Bullock|Trevante Rhodes|John Malkovich,United States,December 21, 2018,2018,R,124 min,Thrillers, A mother journeys blindfolded to protect her children from unseen entities.
+s7,Movie,Marriage Story,Noah Baumbach,Scarlett Johansson|Adam Driver,United States,December 6, 2019,2019,R,137 min,Dramas, A couple navigates a divorce that pushes them to extremes.
+s8,Movie,Extraction,Sam Hargrave,Chris Hemsworth|Rudhraksh Jaiswal,United States,April 24, 2020,2020,R,117 min,Action & Adventure, A mercenary undertakes a deadly mission to rescue a drug lord's kidnapped son.
+"""
+
+def sample_csv_bytes() -> bytes:
+    # Normalize line endings and return UTF-8 bytes
+    return SAMPLE_NETFLIX_CSV.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
+# --------------------------
+# 1) PATHS & CONFIG
+# --------------------------
+st.set_page_config(page_title="Movie Recommender", page_icon="🎬", layout="wide")
+
 try:
-    BASE_DIR = pathlib.Path(__file__).parent
+    BASE_DIR = pathlib.Path(__file__).parent  # typical script usage
 except NameError:
-    BASE_DIR = pathlib.Path.cwd()
+    BASE_DIR = pathlib.Path.cwd()             # fallback (rare environments)
 
 DATA_DIR = BASE_DIR / "data"
 RAW_DATASET_PATH = DATA_DIR / "netflix_titles.csv"
@@ -24,29 +47,32 @@ PROCESSED_DATA_PATH = DATA_DIR / "processed_data.pkl"
 TFIDF_MATRIX_PATH = DATA_DIR / "tfidf_matrix.pkl"
 VECTORIZER_PATH = DATA_DIR / "vectorizer.pkl"
 
-# Ensure data directory exists early
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ---------- HELPER CLEANING FUNCTIONS ----------
+# --------------------------
+# 2) CLEANING HELPERS
+# --------------------------
 def _clean_names(text):
-    """Clean director/cast names into compact tokens."""
+    """Clean director/cast into compact tokens."""
     if pd.isna(text) or text == "":
         return ""
-    names = re.split(r",\s*", str(text))
-    cleaned = [re.sub(r"[^a-z0-9]", "", n.lower().replace(" ", "")) for n in names]
-    return " ".join([c for c in cleaned if c])
+    # Original Kaggle uses comma-separated; some rows above use pipe to show robustness.
+    # Support both separators.
+    parts = re.split(r"[|,]\s*", str(text))
+    tokens = [re.sub(r"[^a-z0-9]", "", p.lower()) for p in parts]
+    return " ".join([t for t in tokens if t])
 
 
 def _clean_genres(text):
-    """Normalize the 'listed_in' column to simple tokens."""
+    """Normalize genre string into tokens."""
     if pd.isna(text) or text == "":
         return ""
     return str(text).lower().replace("&", "").replace(",", " ")
 
 
 def _create_feature_soup(row):
-    """Combine textual features into a single string for TF-IDF."""
+    """Combine textual fields for TF-IDF."""
     return " ".join(
         [
             str(row.get("description_clean", "")),
@@ -57,28 +83,34 @@ def _create_feature_soup(row):
     ).strip()
 
 
-# ---------- PREPROCESSING ----------
-def run_preprocessing_internal(df_path: pathlib.Path = RAW_DATASET_PATH):
+# --------------------------
+# 3) PREPROCESSING
+# --------------------------
+def run_preprocessing_internal(csv_path: pathlib.Path) -> None:
     """
-    Load CSV, filter movies, clean text, build TF-IDF matrix,
-    and save artifacts to disk (pickle).
+    Reads CSV, cleans, builds TF-IDF, and saves artifacts.
+    Raises on hard errors; UI catches and shows clean messages.
     """
-    st.info(f"Starting preprocessing using: {df_path}")
-    if not df_path.exists():
-        raise FileNotFoundError(f"Dataset not found at {df_path}")
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Dataset not found at {csv_path}")
 
-    df = pd.read_csv(df_path)
-    if "type" in df.columns:
-        df = df[df["type"] == "Movie"].copy()  # only movies
-    else:
-        st.warning("'type' column not found — proceeding with the full dataset")
+    df = pd.read_csv(csv_path)
 
-    # Fill missing text columns
-    for col in ["description", "director", "cast", "listed_in"]:
-        if col in df.columns:
-            df[col] = df[col].fillna("")
-        else:
+    # Ensure required columns exist (create blanks if missing so app still works)
+    required = ["title", "type", "description", "director", "cast", "listed_in", "release_year"]
+    for col in required:
+        if col not in df.columns:
             df[col] = ""
+
+    # Keep only movies when possible
+    try:
+        df = df[df["type"].astype(str).str.lower() == "movie"].copy()
+    except Exception:
+        pass
+
+    # Fill NAs
+    for col in ["description", "director", "cast", "listed_in"]:
+        df[col] = df[col].fillna("")
 
     # Clean fields
     df["description_clean"] = df["description"].astype(str).str.lower()
@@ -86,14 +118,14 @@ def run_preprocessing_internal(df_path: pathlib.Path = RAW_DATASET_PATH):
     df["cast_clean"] = df["cast"].apply(lambda x: " ".join(_clean_names(x).split()[:3]))
     df["listed_in_clean"] = df["listed_in"].apply(_clean_genres)
 
-    # Combine features
+    # Feature soup
     df["features"] = df.apply(_create_feature_soup, axis=1)
     df = df[df["features"].str.strip().str.len() > 0].copy()
     df.reset_index(drop=True, inplace=True)
 
     # Vectorize
-    tfidf_vectorizer = TfidfVectorizer(stop_words="english", max_features=10000)
-    tfidf_matrix = tfidf_vectorizer.fit_transform(df["features"])
+    vectorizer = TfidfVectorizer(stop_words="english", max_features=10000)
+    tfidf_matrix = vectorizer.fit_transform(df["features"])
 
     # Save artifacts
     with open(PROCESSED_DATA_PATH, "wb") as f:
@@ -101,25 +133,35 @@ def run_preprocessing_internal(df_path: pathlib.Path = RAW_DATASET_PATH):
     with open(TFIDF_MATRIX_PATH, "wb") as f:
         pickle.dump(tfidf_matrix, f)
     with open(VECTORIZER_PATH, "wb") as f:
-        pickle.dump(tfidf_vectorizer, f)
-
-    st.success(f"Preprocessing complete — saved artifacts to '{DATA_DIR}'.")
-    return True
+        pickle.dump(vectorizer, f)
 
 
-# ---------- RECOMMENDATION ENGINE ----------
+def ensure_artifacts(auto_use_sample: bool = True) -> None:
+    """
+    Ensure artifacts exist. If RAW CSV missing and auto_use_sample is True,
+    write the built-in sample and preprocess automatically.
+    """
+    have_artifacts = all(p.exists() for p in [PROCESSED_DATA_PATH, TFIDF_MATRIX_PATH, VECTORIZER_PATH])
+    if have_artifacts:
+        return
+
+    # Ensure a CSV exists
+    if not RAW_DATASET_PATH.exists() and auto_use_sample:
+        RAW_DATASET_PATH.write_bytes(sample_csv_bytes())
+
+    # If still no CSV, bail (caller will show uploader UI)
+    if not RAW_DATASET_PATH.exists():
+        return
+
+    # Build artifacts
+    run_preprocessing_internal(RAW_DATASET_PATH)
+
+
+# --------------------------
+# 4) ENGINE
+# --------------------------
 class RecommendationEngine:
-    """
-    Loads precomputed artifacts (or raises). Exposes two helper methods:
-     - get_recommendations_by_title
-     - get_recommendations_by_query
-    """
-
     def __init__(self):
-        # load artifacts, or raise
-        if not all([PROCESSED_DATA_PATH.exists(), TFIDF_MATRIX_PATH.exists(), VECTORIZER_PATH.exists()]):
-            raise FileNotFoundError("One or more artifact files are missing. Please preprocess the dataset first.")
-
         with open(PROCESSED_DATA_PATH, "rb") as f:
             self.df = pickle.load(f)
         with open(TFIDF_MATRIX_PATH, "rb") as f:
@@ -127,136 +169,116 @@ class RecommendationEngine:
         with open(VECTORIZER_PATH, "rb") as f:
             self.vectorizer = pickle.load(f)
 
-    def _get_recommendations_from_vector(self, query_vector, top_n=5, exclude_index=None):
-        sim_scores = cosine_similarity(query_vector, self.tfidf_matrix).flatten()
-        if exclude_index is not None:
-            sim_scores[exclude_index] = 0
-        indices = sim_scores.argsort()[::-1][:top_n]
-        return self.df.iloc[indices]
+    def _from_vector(self, query_vector, top_n=5, exclude_index=None):
+        sims = cosine_similarity(query_vector, self.tfidf_matrix).flatten()
+        if exclude_index is not None and 0 <= exclude_index < sims.size:
+            sims[exclude_index] = 0
+        idxs = sims.argsort()[::-1][:top_n]
+        return self.df.iloc[idxs]
 
-    def get_recommendations_by_title(self, title, top_n=5):
+    def by_title(self, title, top_n=5):
         try:
             idx = int(self.df[self.df["title"] == title].index[0])
         except Exception:
             return pd.DataFrame()
-        query_vector = self.tfidf_matrix[idx]
-        return self._get_recommendations_from_vector(query_vector, top_n=top_n, exclude_index=idx)
+        return self._from_vector(self.tfidf_matrix[idx], top_n=top_n, exclude_index=idx)
 
-    def get_recommendations_by_query(self, query_text, top_n=5):
-        if not query_text or not query_text.strip():
+    def by_query(self, text, top_n=5):
+        if not text or not str(text).strip():
             return pd.DataFrame()
-        query_vector = self.vectorizer.transform([query_text.lower()])
-        return self._get_recommendations_from_vector(query_vector, top_n=top_n)
+        v = self.vectorizer.transform([str(text).lower()])
+        return self._from_vector(v, top_n=top_n)
 
 
-# ---------- UTIL: Try load or return None ----------
-def try_load_engine():
-    """Attempt to instantiate RecommendationEngine and return it, or None if artifacts missing."""
+@st.cache_resource(show_spinner=False)
+def load_engine_cached():
+    # Ensure artifacts (auto-fallback to sample if needed)
     try:
-        engine = RecommendationEngine()
-        return engine
-    except FileNotFoundError:
-        return None
+        ensure_artifacts(auto_use_sample=True)
     except Exception as e:
-        st.error(f"Unexpected error while loading engine: {e}")
+        # Let UI rebuild on demand; don't cache failures
+        st.session_state["_ensure_error"] = str(e)
         return None
 
+    # If artifacts exist, load engine
+    if all(p.exists() for p in [PROCESSED_DATA_PATH, TFIDF_MATRIX_PATH, VECTORIZER_PATH]):
+        try:
+            return RecommendationEngine()
+        except Exception as e:
+            st.session_state["_engine_error"] = str(e)
+            return None
+    return None
 
-# ---------- STREAMLIT UI ----------
-def display_recommendations(recommendations: pd.DataFrame):
-    if recommendations is None or recommendations.empty:
+
+# --------------------------
+# 5) UI HELPERS
+# --------------------------
+def display_recs(df: pd.DataFrame):
+    if df is None or df.empty:
         st.warning("No recommendations found.")
         return
-    for i, (_, row) in enumerate(recommendations.iterrows()):
+    for i, (_, row) in enumerate(df.iterrows()):
         st.subheader(f"#{i+1}: {row.get('title', 'Untitled')} ({row.get('release_year', 'N/A')})")
-        col_genre, col_director = st.columns([1, 1])
-        with col_genre:
+        c1, c2 = st.columns([1, 1])
+        with c1:
             st.markdown(f"**Genre:** {row.get('listed_in', 'N/A')}")
-        with col_director:
+        with c2:
             st.markdown(f"**Director:** {row.get('director', 'N/A')}")
         with st.expander("Show Synopsis"):
             st.write(row.get("description", "No description available."))
         st.markdown("---")
 
 
-def run_app():
-    st.set_page_config(page_title="Movie Recommender", page_icon="🎬", layout="wide")
-    st.title("🎬 Content-Based Movie Recommender")
+def rebuild_artifacts_from_current_csv():
+    try:
+        run_preprocessing_internal(RAW_DATASET_PATH)
+        st.success("Artifacts rebuilt successfully.")
+        st.cache_resource.clear()  # clear the engine cache
+    except Exception as e:
+        st.error(f"Rebuild failed: {e}")
 
-    # Try to load existing artifacts (fast path)
-    engine = try_load_engine()
 
-    if engine is None:
-        st.warning(
-            "Preprocessed model artifacts not found. You must provide the 'netflix_titles.csv' dataset "
-            "so the app can preprocess it and build TF-IDF artifacts."
+# --------------------------
+# 6) APP
+# --------------------------
+st.title("🎬 Content-Based Movie Recommender")
+
+# Top utility bar (download sample + rebuild)
+with st.expander("Data & Utilities", expanded=False):
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        st.download_button(
+            "Download sample CSV",
+            data=sample_csv_bytes(),
+            file_name="netflix_titles_sample.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help="Grab a small built-in sample you can inspect or modify."
         )
+    with c2:
+        if st.button("Rebuild artifacts from current CSV", use_container_width=True):
+            rebuild_artifacts_from_current_csv()
 
-        st.markdown("**Options to provide the data:**")
-        st.markdown(
-            "- Place `netflix_titles.csv` into the `data/` folder (same folder as this app), **or**\n"
-            "- Upload the CSV using the uploader below (the app will save it to `data/netflix_titles.csv` and preprocess)."
-        )
+    st.caption(f"Current data folder: `{DATA_DIR}`")
 
-        uploaded_file = st.file_uploader("Upload netflix_titles.csv", type=["csv"], help="Upload the Kaggle CSV export.")
-        if uploaded_file is not None:
-            st.info("File uploaded. Click **Upload & Preprocess** to save and start preprocessing.")
-            if st.button("Upload & Preprocess"):
-                # Save uploaded file to disk and run preprocessing, then load engine
-                with open(RAW_DATASET_PATH, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                with st.spinner("Running preprocessing (this can take a while for large CSVs)..."):
-                    try:
-                        run_preprocessing_internal(RAW_DATASET_PATH)
-                        engine = try_load_engine()
-                        if engine:
-                            st.success("Model built and loaded successfully — you can now use the app.")
-                        else:
-                            st.error("Preprocessing finished but engine failed to load. Check logs above.")
-                    except Exception as e:
-                        st.error(f"Preprocessing failed: {e}")
+# Load engine (auto-preprocess with sample if needed)
+engine = load_engine_cached()
 
-        # If still no engine, stop further UI construction
-        if engine is None:
-            st.stop()
+# If engine still missing, show uploader and a "Use sample now" button
+if engine is None:
+    st.warning(
+        "Model artifacts are not available yet. Provide a dataset below or use the built-in sample."
+    )
 
-    # If engine is present, build the main UI
-    st.markdown("---")
-    tab1, tab2 = st.tabs(["Recommend by Movie", "Recommend by Description"])
+    up = st.file_uploader(
+        "Upload your netflix_titles.csv",
+        type=["csv"],
+        help="Kaggle Netflix Titles CSV. The app will save it to data/netflix_titles.csv and build artifacts."
+    )
 
-    with tab1:
-        st.header("Find movies similar to one you like")
-        movie_titles = sorted(engine.df["title"].dropna().unique().tolist())
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            selected_movie = st.selectbox("Choose a movie:", options=movie_titles)
-        with col2:
-            num_recs = st.slider("Number of recommendations:", 3, 10, 5, key="slider1")
-
-        if st.button("Get Recommendations", key="btn_title"):
-            if selected_movie:
-                with st.spinner("Finding similar movies..."):
-                    recs = engine.get_recommendations_by_title(selected_movie, top_n=num_recs)
-                    display_recommendations(recs)
-            else:
-                st.warning("Please select a movie.")
-
-    with tab2:
-        st.header("Find movies based on what you're in the mood for")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            query_text = st.text_area("Describe the movie you want:", "a fast-paced action movie with spies", height=100)
-        with col2:
-            num_recs_q = st.slider("Number of recommendations:", 3, 10, 5, key="slider2")
-
-        if st.button("Get Recommendations", key="btn_query"):
-            if query_text and query_text.strip():
-                with st.spinner("Finding recommendations..."):
-                    recs = engine.get_recommendations_by_query(query_text, top_n=num_recs_q)
-                    display_recommendations(recs)
-            else:
-                st.warning("Please enter a description.")
-
-
-if __name__ == "__main__":
-    run_app()
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("Use built-in sample now", use_container_width=True):
+            try:
+                RAW_DATASET_PATH.write_bytes(sample_csv_bytes())
+                run_preprocessing_
